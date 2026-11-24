@@ -525,6 +525,95 @@ class VerlMemoryTests(unittest.TestCase):
         self.assertAlmostEqual(values[4],.15)
         self.assertEqual(len(records),2)
 
+    def test_sf_uses_generated_f1_reuses_terminal_answers_and_keeps_question_intersection(self):
+        from verl_memory.train import score_trajectories
+        from memfactory.diagnostics import EvidenceStore
+        args = SimpleNamespace(kind='sf', aux_lambda=.1, aux_tau=.5, credit_interval=1,
+                               max_prompt_tokens=4096, max_new_tokens=2048)
+        questions = [dict(question_id='q0', question='q0', answer='blue', sf_ready_after_turn=1),
+                     dict(question_id='q1', question='q1', answer='green', sf_ready_after_turn=2),
+                     dict(question_id='q2', question='q2', answer='gold', sf_ready_after_turn=None)]
+        timeline = dict(dialogue_id='d', participants=['A'], questions=questions,
+                        turns=[dict(turn_index=i) for i in range(3)])
+        calls = []
+        def generate(workers, requests, args, root, label, **kwargs):
+            self.assertFalse(kwargs.get('gold', False))
+            self.assertTrue(all('gold' not in r for r in requests))
+            calls.append((label, requests))
+            result = []
+            for r in requests:
+                question, bank = r['prompt'].split(':')
+                prediction = {'q0': {'a':'blue extra', 'b':'blue', 'c':'red'},
+                              'q1': {'b':'green', 'c':'green'}, 'q2': {'c':'gold'}}[question][bank]
+                result.append(dict(prediction=prediction, raw_answer=prediction,
+                                   hit_token_limit=False, output_tokens=2))
+            return result
+        with tempfile.TemporaryDirectory() as tmp:
+            store = EvidenceStore(tmp)
+            trajectories = [dict(trajectory_id=i, bank=['c'], bank_points=[
+                dict(after_turn=j, memory_bank_ref=store.save(bank))
+                for j,bank in enumerate([[], ['a'], ['b'], ['c']])]) for i in range(2)]
+            with patch('verl_memory.train.score_requests', side_effect=generate), patch(
+                    'verl_memory.train.answer_prompt',
+                    side_effect=lambda q,b,*a: (q+':'+(b[0] if b else 'empty'), [])):
+                advantages, credit = score_trajectories(trajectories,timeline,[],args,tmp,1,0)
+            self.assertEqual([label for label,_ in calls], ['terminal_qa','sf_f1'])
+            # Three unique intermediate prompts, shared across both trajectories;
+            # the final snapshots reuse the terminal QA outputs.
+            self.assertEqual(len(calls[1][1]), 3)
+            self.assertEqual({r['prompt'] for r in calls[1][1]}, {'q0:a','q0:b','q1:b'})
+            self.assertAlmostEqual(advantages[0][0], 0.)  # first eligible snapshot
+            self.assertAlmostEqual(advantages[0][1], .1*(1-2/3)/.5)
+            self.assertAlmostEqual(advantages[0][2], -.1)
+            self.assertEqual(credit[1]['common_question_count'], 1)
+            self.assertEqual(credit[2]['common_question_count'], 2)
+            rows = [json.loads(line) for line in (Path(tmp)/'bank_scores.jsonl').read_text().splitlines()]
+            self.assertTrue(all(r['score_metric']=='generated_f1' and 'ell' not in r for r in rows))
+            from verl_memory.protocol import load_bank
+            evidence = load_bank(tmp, rows[0]['score_evidence_ref'])
+            self.assertEqual(evidence['prediction'], 'blue extra')
+            self.assertAlmostEqual(evidence['f1'], 2/3)
+
+    def test_sf_zero_lambda_and_validation_do_not_score_snapshots(self):
+        from verl_memory.train import score_trajectories
+        timeline = dict(dialogue_id='d', participants=['A'], turns=[dict(turn_index=0)],
+                        questions=[dict(question_id='q', question='q', answer='blue')])
+        output = dict(prediction='blue', hit_token_limit=False, output_tokens=1)
+        for kind,weight,training in [('sf',0.,True),('sa',.1,True),('sf',.1,False)]:
+            with self.subTest(kind=kind,weight=weight,training=training), tempfile.TemporaryDirectory() as tmp:
+                args = SimpleNamespace(kind=kind, aux_lambda=weight, max_prompt_tokens=4096,max_new_tokens=2048)
+                trajectories = [dict(trajectory_id=i,bank=[]) for i in range(2)]
+                with patch('verl_memory.train.score_requests', return_value=[output,output]) as score, patch(
+                        'verl_memory.train.answer_prompt', return_value=('prompt',[])):
+                    _,credit = score_trajectories(trajectories,timeline,[],args,tmp,1,0,training=training)
+                score.assert_called_once()
+                self.assertEqual(credit, [])
+
+    def test_sf_all_snapshot_prompts_cached_closes_answer_phase_without_generation(self):
+        import sys
+        from verl_memory.train import score_trajectories
+        from memfactory.diagnostics import EvidenceStore
+        args = SimpleNamespace(kind='sf', aux_lambda=.1, aux_tau=.5, credit_interval=4,
+                               max_prompt_tokens=4096,max_new_tokens=2048)
+        timeline = dict(dialogue_id='d',participants=['A'],turns=[dict(turn_index=0)],
+                        questions=[dict(question_id='q',question='q',answer='blue',sf_ready_after_turn=1)])
+        output = dict(prediction='blue',hit_token_limit=False,output_tokens=1)
+        worker = SimpleNamespace(sleep=SimpleNamespace(remote=Mock(return_value='asleep')))
+        fake_ray = SimpleNamespace(get=Mock())
+        with tempfile.TemporaryDirectory() as tmp:
+            store = EvidenceStore(tmp)
+            trajectory = dict(trajectory_id=0,bank=[],bank_points=[
+                dict(after_turn=0,memory_bank_ref=store.save([])),
+                dict(after_turn=1,memory_bank_ref=store.save([]))])
+            with patch.dict(sys.modules, {'ray':fake_ray}), patch(
+                    'verl_memory.train.score_requests',return_value=[output]) as score, patch(
+                    'verl_memory.train.answer_prompt',return_value=('prompt',[])):
+                _,credit = score_trajectories([trajectory],timeline,[worker],args,tmp,1,0)
+            score.assert_called_once()
+            worker.sleep.remote.assert_called_once_with()
+            fake_ray.get.assert_called_once_with(['asleep'])
+            self.assertEqual(credit[0]['delta'], 0.)
+
     def test_block_scores_compare_only_common_questions(self):
         points = [
             dict(after_turn=0, phi=-2, scores_by_question={'q0': -2}),

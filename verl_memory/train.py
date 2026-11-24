@@ -267,10 +267,7 @@ def score_requests(workers, requests, args, root, label, gold=False,
         failed = True
         raise
     finally:
-        # A successful terminal-QA phase can leave the Answer engines awake
-        # for the immediately following SF gold phase. vLLM 0.24's V1
-        # LoRA+prompt_logprobs path is sensitive to a sleep/wake transition;
-        # the caller owns the one lifecycle for both phases in that case.
+        # Terminal and snapshot QA share one Answer engine lifecycle.
         if sleep_after or failed:
             try:
                 ray.get([worker.sleep.remote() for worker in workers])
@@ -305,14 +302,15 @@ def score_trajectories(trajectories, timeline, workers, args, root, epoch, group
             prompt, retrieved = answer_prompt(q['question'],trajectory['bank'],timeline['participants'],top_k_per_speaker)
             requests.append(dict(prompt=prompt,max_prompt_tokens=args.max_prompt_tokens,max_new_tokens=args.max_new_tokens))
             identities.append((trajectory,q,retrieved))
-    # Keep Answer vLLM awake across terminal QA and SF gold scoring. The
-    # manager is already sleeping while this function runs, so this does not
-    # increase the peak GPU residency; it removes an unsafe second wake.
+    # Reuse the same greedy decoding path for terminal and snapshot QA.
     sf_phase = training and args.kind == 'sf' and args.aux_lambda != 0
     answer_awake = bool(requests) and sf_phase
     outputs = score_requests(workers,requests,args,root,'terminal_qa',
                              sleep_after=not answer_awake)
+    generated = {}
     for request, output, (t,q,retrieved) in zip(requests,outputs,identities,strict=True):
+        key = hashlib.sha256(json.dumps([request['prompt'],q['answer']],ensure_ascii=False).encode()).hexdigest()
+        generated[key] = output
         row = dict(dialogue_id=timeline['dialogue_id'],question_id=q['question_id'],question=q['question'],
             gold=q['answer'],category=q.get('category'),**output,
             f1=f1_score(output['prediction'],q['answer']),em=exact_match(output['prediction'],q['answer']),
@@ -349,11 +347,14 @@ def score_trajectories(trajectories, timeline, workers, args, root, epoch, group
                 for q in eligible:
                     prompt,retrieved = answer_prompt(q['question'],bank,timeline['participants'],top_k_per_speaker)
                     key = hashlib.sha256(json.dumps([prompt,q['answer']],ensure_ascii=False).encode()).hexdigest()
-                    unique.setdefault(key,dict(prompt=prompt,gold=q['answer'],max_prompt_tokens=args.max_prompt_tokens))
+                    unique.setdefault(key,dict(prompt=prompt,max_prompt_tokens=args.max_prompt_tokens,
+                                               max_new_tokens=args.max_new_tokens))
                     locations.append((t['trajectory_id'],point,q,key,retrieved))
-        if unique:
-            outputs = score_requests(workers,list(unique.values()),args,root,'sf_gold',gold=True,
+        pending = {key:request for key,request in unique.items() if key not in generated}
+        if pending:
+            outputs = score_requests(workers,list(pending.values()),args,root,'sf_f1',
                                      wake_before=not answer_awake, sleep_after=True)
+            generated.update(zip(pending,outputs,strict=True))
             answer_awake = False
         elif answer_awake:
             # score_requests returns early for an empty request list, so close
@@ -361,22 +362,24 @@ def score_trajectories(trajectories, timeline, workers, args, root, epoch, group
             import ray
             ray.get([worker.sleep.remote() for worker in workers])
             answer_awake = False
-        by_key = dict(zip(unique,outputs,strict=True))
         for tid,point,q,key,retrieved in locations:
-            output = by_key[key]
-            point['scores'].append(output['ell'])
-            point['scores_by_question'][str(q['question_id'])] = output['ell']
+            output = generated[key]
+            score = f1_score(output['prediction'],q['answer'])
+            point['scores'].append(score)
+            point['scores_by_question'][str(q['question_id'])] = score
             append_json(Path(root)/'bank_scores.jsonl',dict(epoch=epoch,group=group,dialogue_id=timeline['dialogue_id'],
                 trajectory_id=tid,after_turn=point['after_turn'],question_id=q['question_id'],**output,
+                question=q['question'],gold=q['answer'],f1=score,score_metric='generated_f1',
                 memory_bank_ref=point['memory_bank_ref'],score_evidence_ref=store.save(
-                    dict(**unique[key],retrieved_memories=retrieved,**output),'bank_score')))
+                    dict(**unique[key],gold=q['answer'],f1=score,score_metric='generated_f1',
+                         retrieved_memories=retrieved,**output),'bank_score')))
         for t,a in zip(trajectories,terminal):
             for point in t['bank_points']:
                 point['phi'] = mean(point['scores']) if point['scores'] else None
             values,blocks = block_advantages(t['bank_points'],a,len(timeline['turns']),
                 args.credit_interval,args.aux_lambda,args.aux_tau)
             advantages[t['trajectory_id']] = values
-            credit.extend(dict(trajectory_id=t['trajectory_id'],**b) for b in blocks)
+            credit.extend(dict(trajectory_id=t['trajectory_id'],score_metric='generated_f1',**b) for b in blocks)
     return advantages,credit
 
 
@@ -762,6 +765,7 @@ def resume_state(args, root, data_paths):
               'max_prompt_tokens','max_new_tokens','qa_batch_size','answer_batch_size','gold_batch_size',
               'train_token_budget','smoke_turns')
     expected = dict(settings={key:getattr(args,key,None) for key in fields},prompts=fingerprint(),
+                    auxiliary_score='generated_f1',
                     data={str(Path(p).resolve()):hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in data_paths})
     if args.resume_from:
         state = read_json(Path(args.resume_from)/'training_state.json')
@@ -840,6 +844,7 @@ def run(args):
         gpu_schedule='four_gpu_phase_shared',answer_gpu_tokens=answer_gpu_tokens,
         initial_bank='empty',qa='after_final_turn',prompts=fingerprint(),
         reward='per_QA_population_standardization_then_mean' if args.task != 'answer' else 'per_QA_population_standardization',
+        auxiliary_score='generated_f1' if args.task == 'manager' and args.kind == 'sf' else None,
         reference='base model with LoRA disabled',old_policy='fixed pre-update teacher-forced token log probabilities',
         epoch_zero_validation=False,intermediate_checkpoints=False))
     ray.init(runtime_env={'env_vars':dict(PYTHONPATH=str(Path(__file__).resolve().parents[1]),
@@ -995,7 +1000,7 @@ def main(argv=None):
     p.add_argument('--aux-tau',type=float,default=.5)
     p.add_argument('--answer-batch-size',type=int,default=16)
     p.add_argument('--gold-batch-size',type=int,default=4,
-                   help='Per-worker batch size for SF teacher-forced gold scoring')
+                   help='Legacy teacher-forced scoring batch size; unused by generated-F1 SF')
     p.add_argument('--train-token-budget',type=int,default=8192)
     p.add_argument('--manager-memory-fraction',type=float,default=.60)
     p.add_argument('--answer-memory-fraction',type=float,default=.65)
